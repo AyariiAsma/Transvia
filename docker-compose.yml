@@ -1,0 +1,134 @@
+version: '3.9'
+
+services:
+  # ─── PostgreSQL + PostGIS ─────────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: logistic_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-logistic_db}
+      POSTGRES_USER: ${DB_USER:-logistic_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-logistic_pass}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./apps/api/prisma/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-logistic_user} -d ${DB_NAME:-logistic_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: logistic_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD:-}"
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── OSRM (Routing open-source) ───────────────────────────────────────────
+  # Note: Pour la production, pré-télécharger les données OSM du Maghreb
+  # et compiler avec osrm-extract + osrm-partition + osrm-customize
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: logistic_osrm
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    # En dev, utilise l'API publique OSRM — en prod, monte un volume avec les données
+    command: ["osrm-routed", "--algorithm", "mld", "/data/map.osrm"]
+    volumes:
+      - osrm_data:/data
+    profiles:
+      - osrm  # Optionnel en dev (utilise l'API publique par défaut)
+
+  # ─── API NestJS ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+      target: development
+    container_name: logistic_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-logistic_user}:${DB_PASSWORD:-logistic_pass}@postgres:5432/${DB_NAME:-logistic_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379
+    ports:
+      - "${API_PORT:-3000}:3000"
+    volumes:
+      - ./apps/api:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: npm run start:dev
+
+  # ─── Admin Web (Next.js) ───────────────────────────────────────────────────
+  admin-web:
+    build:
+      context: ./apps/admin-web
+      dockerfile: Dockerfile
+      target: development
+    container_name: logistic_admin
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:3000
+      NEXT_PUBLIC_WS_URL: ws://api:3000
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./apps/admin-web:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+
+  # ─── MinIO (dev) — Optionnel si pas Cloudinary en dev ──────────────────────
+  # minio:
+  #   image: minio/minio:latest
+  #   command: server /data --console-address ":9001"
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   environment:
+  #     MINIO_ROOT_USER: minioadmin
+  #     MINIO_ROOT_PASSWORD: minioadmin
+  #   volumes:
+  #     - minio_data:/data
+
+  # ─── Redis Insight (UI dev) ──────────────────────────────────────────────
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: logistic_redis_insight
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+  redis_data:
+  osrm_data:
+
+networks:
+  default:
+    name: logistic_network
